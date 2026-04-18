@@ -12,6 +12,11 @@ const predictionRunSchema = new mongoose.Schema(
       required: true,
       enum: ["ARIMA", "XGBoost", "LSTM"],
     },
+    /** Requested in POST /forecast/run (winner stored in modelName when "all") */
+    requestedModelType: {
+      type: String,
+      enum: ["arima", "xgboost", "lstm", "all"],
+    },
     runTime: {
       type: Date,
       default: Date.now,

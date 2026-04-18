@@ -10,50 +10,12 @@ const {
 } = require("../middleware/auth.middleware");
 const { logger } = require("../utils/logger");
 const { generateRunId } = require("../utils/helpers");
+const { runForecast, runRetrain } = require("../services/mlClient");
 
 const router = express.Router();
 
-// Helper: simple moving average forecast
-function movingAverageForecast(historical, horizon, window = 7) {
-  if (historical.length < window) {
-    const mean = historical.reduce((s, v) => s + v, 0) / historical.length;
-    return Array(horizon).fill(mean);
-  }
-  const recent = historical.slice(-window);
-  const avg = recent.reduce((s, v) => s + v, 0) / window;
-  return Array(horizon).fill(avg);
-}
+const MIN_ML_POINTS = 42;
 
-// Calculate metrics between actual and predicted
-function calculateMetrics(actual, predicted) {
-  const n = actual.length;
-  const mae =
-    actual.reduce((sum, a, i) => sum + Math.abs(a - predicted[i]), 0) / n;
-  const rmse = Math.sqrt(
-    actual.reduce((sum, a, i) => sum + Math.pow(a - predicted[i], 2), 0) / n
-  );
-  const mape =
-    (actual.reduce((sum, a, i) => sum + Math.abs((a - predicted[i]) / a), 0) /
-      n) *
-    100;
-  const ssRes = actual.reduce(
-    (sum, a, i) => sum + Math.pow(a - predicted[i], 2),
-    0
-  );
-  const ssTot = actual.reduce(
-    (sum, a) => sum + Math.pow(a - actual.reduce((s, v) => s + v, 0) / n, 2),
-    0
-  );
-  const r2 = 1 - ssRes / ssTot;
-  return {
-    mae: +mae.toFixed(2),
-    rmse: +rmse.toFixed(2),
-    mape: +mape.toFixed(2),
-    r2: +r2.toFixed(2),
-  };
-}
-
-// Function to get proper model name matching enum
 function getModelName(modelType) {
   switch (modelType) {
     case "arima":
@@ -67,6 +29,19 @@ function getModelName(modelType) {
     default:
       return "XGBoost";
   }
+}
+
+async function aggregateDailySales(query) {
+  return SalesRecord.aggregate([
+    { $match: query },
+    {
+      $group: {
+        _id: { $dateToString: { format: "%Y-%m-%d", date: "$saleDate" } },
+        quantity: { $sum: "$quantity" },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ]);
 }
 
 // Run forecast
@@ -94,7 +69,13 @@ router.post(
         hyperparameters,
       } = req.body;
 
-      // Build query for historical data
+      if (!String(process.env.ML_SERVICE_URL || "").trim()) {
+        return res.status(503).json({
+          message:
+            "ML service is not configured. Set ML_SERVICE_URL (e.g. http://127.0.0.1:8000) in Food-demand-forecasting-app-backend/.env and restart the API.",
+        });
+      }
+
       let query = {};
       if (centerId) query.centerId = centerId;
       if (mealId) query.mealId = mealId;
@@ -104,49 +85,43 @@ router.post(
         if (dateRange.end) query.saleDate.$lte = new Date(dateRange.end);
       }
 
-      // Get historical sales grouped by day
-      const historicalSales = await SalesRecord.aggregate([
-        { $match: query },
-        {
-          $group: {
-            _id: { $dateToString: { format: "%Y-%m-%d", date: "$saleDate" } },
-            quantity: { $sum: "$quantity" },
-          },
-        },
-        { $sort: { _id: 1 } },
-      ]);
+      const historicalSales = await aggregateDailySales(query);
 
-      if (historicalSales.length === 0) {
-        return res
-          .status(400)
-          .json({ message: "No historical data available for forecasting." });
+      if (historicalSales.length < MIN_ML_POINTS) {
+        return res.status(400).json({
+          message: `Need at least ${MIN_ML_POINTS} days of sales for ML forecasting. Found ${historicalSales.length}.`,
+        });
       }
 
+      const dates = historicalSales.map((d) => d._id);
       const quantities = historicalSales.map((d) => d.quantity);
-      const total = quantities.length;
-      const trainSize = Math.floor(total * 0.8); // 80% train, 20% test
-      const train = quantities.slice(0, trainSize);
-      const test = quantities.slice(trainSize);
+      const total = historicalSales.length;
+      const trainSize = Math.floor(total * 0.8);
 
-      const daysToForecast = forecastHorizon === "daily" ? 7 : 28;
-      const forecast = movingAverageForecast(quantities, daysToForecast, 7);
-
-      // Evaluate on test set if available
-      let metrics = { mae: 0, rmse: 0, mape: 0, r2: 0 };
-      if (test.length > 0) {
-        const predictedTest = movingAverageForecast(train, test.length, 7);
-        metrics = calculateMetrics(test, predictedTest);
-      } else {
-        // If no test data, use in-sample metrics (less ideal)
-        const predictedTrain = movingAverageForecast(train, train.length, 7);
-        metrics = calculateMetrics(train, predictedTrain);
+      let ml;
+      try {
+        ml = await runForecast({
+          dates,
+          quantities,
+          modelType,
+          forecastHorizon,
+        });
+      } catch (e) {
+        const status = e.status && e.status >= 400 && e.status < 600 ? e.status : 502;
+        logger.error("ML forecast failed:", e.message);
+        return res.status(status).json({
+          message: e.message || "ML forecasting service error",
+        });
       }
 
-      // Create prediction run record - FIXED: using getModelName()
       const runId = generateRunId();
+      const resolvedModelName =
+        modelType === "all" && ml.modelName ? ml.modelName : getModelName(modelType);
+
       const predictionRun = new PredictionRun({
         runId,
-        modelName: getModelName(modelType),
+        modelName: resolvedModelName,
+        requestedModelType: modelType,
         forecastType: forecastHorizon,
         hyperparameters,
         triggeredBy: req.userId,
@@ -155,70 +130,77 @@ router.post(
           start: historicalSales[0]._id,
           end: historicalSales[trainSize - 1]?._id,
         },
-        testPeriod: test.length
-          ? {
-              start: historicalSales[trainSize]?._id,
-              end: historicalSales[historicalSales.length - 1]._id,
-            }
-          : undefined,
+        testPeriod:
+          trainSize < total
+            ? {
+                start: historicalSales[trainSize]?._id,
+                end: historicalSales[total - 1]._id,
+              }
+            : undefined,
       });
       await predictionRun.save();
 
-      // Save predictions
-      const predictions = [];
-      for (let i = 0; i < daysToForecast; i++) {
-        const forecastDate = new Date();
-        forecastDate.setDate(forecastDate.getDate() + i + 1);
-        const predQuantity = forecast[i];
-        predictions.push({
-          runId: predictionRun._id,
-          forecastDate,
-          centerId: centerId || "C001",
-          mealId: mealId || "M001",
-          predictedQuantity: Math.max(0, Math.floor(predQuantity)),
-          predictedCustomers: Math.floor(predQuantity * 0.8),
-          confidenceLower: Math.floor(predQuantity * 0.8),
-          confidenceUpper: Math.floor(predQuantity * 1.2),
-        });
+      const defaultCenter = centerId || "C001";
+      const defaultMeal = mealId || "M001";
+
+      const predictions = (ml.predictions || []).map((p) => ({
+        runId: predictionRun._id,
+        forecastDate: new Date(p.date + "T12:00:00.000Z"),
+        centerId: defaultCenter,
+        mealId: defaultMeal,
+        predictedQuantity: p.predictedQuantity,
+        predictedCustomers: p.predictedCustomers,
+        confidenceLower: p.confidenceLower,
+        confidenceUpper: p.confidenceUpper,
+      }));
+      if (predictions.length === 0) {
+        return res.status(502).json({ message: "ML service returned no predictions." });
       }
       await PredictionResult.insertMany(predictions);
 
-      // Save metrics
+      const m = ml.metrics || {};
       const modelMetric = new ModelMetric({
         runId: predictionRun._id,
-        mae: metrics.mae,
-        rmse: metrics.rmse,
-        mape: metrics.mape,
-        r2Score: metrics.r2,
-        featureImportance:
-          modelType === "xgboost" || modelType === "all"
-            ? [
-                { feature: "lag_1", importance: 0.32 },
-                { feature: "rolling_avg_7", importance: 0.21 },
-                { feature: "day_of_week", importance: 0.15 },
-                { feature: "month", importance: 0.12 },
-                { feature: "is_weekend", importance: 0.1 },
-                { feature: "week_of_year", importance: 0.06 },
-                { feature: "quarter", importance: 0.04 },
-              ]
-            : [],
+        mae: m.mae,
+        rmse: m.rmse,
+        mape: m.mape,
+        r2Score: m.r2Score,
+        featureImportance: Array.isArray(ml.featureImportance)
+          ? ml.featureImportance
+          : [],
+        modelComparison: Array.isArray(ml.comparison) ? ml.comparison : [],
+        holdoutSeries: Array.isArray(ml.holdoutSeries) ? ml.holdoutSeries : [],
       });
       await modelMetric.save();
 
-      logger.info(`Forecast completed: ${runId}`);
+      logger.info(`Forecast completed: ${runId} (${resolvedModelName})`);
 
-      res.json({
+      const responsePayload = {
         runId: predictionRun.runId,
-        modelName: predictionRun.modelName,
-        predictions: predictions.map((p) => ({
-          date: p.forecastDate.toISOString().split("T")[0],
-          predictedQuantity: p.predictedQuantity,
-          predictedCustomers: p.predictedCustomers,
-          confidenceLower: p.confidenceLower,
-          confidenceUpper: p.confidenceUpper,
-        })),
-        metrics,
-      });
+        modelName: resolvedModelName,
+        predictions: ml.predictions,
+        metrics: {
+          mae: m.mae,
+          rmse: m.rmse,
+          mape: m.mape,
+          r2Score: m.r2Score,
+        },
+      };
+      if (Array.isArray(ml.comparison) && ml.comparison.length) {
+        responsePayload.comparison = ml.comparison;
+      }
+      if (Array.isArray(ml.featureImportance) && ml.featureImportance.length) {
+        responsePayload.featureImportance = ml.featureImportance;
+      }
+      if (Array.isArray(ml.holdoutSeries) && ml.holdoutSeries.length) {
+        responsePayload.holdoutSeries = ml.holdoutSeries;
+      }
+      if (modelType === "all") {
+        responsePayload.requestedModelType = "all";
+        responsePayload.bestModelName = resolvedModelName;
+      }
+
+      res.json(responsePayload);
     } catch (error) {
       logger.error("Forecast run error:", error);
       res.status(500).json({ message: "Server error" });
@@ -238,9 +220,8 @@ router.get("/results/:runId", authMiddleware, async (req, res) => {
     const predictions = await PredictionResult.find({
       runId: predictionRun._id,
     });
-    const metrics = await ModelMetric.findOne({ runId: predictionRun._id });
+    const metricsDoc = await ModelMetric.findOne({ runId: predictionRun._id });
 
-    // Get actual data for comparison for dates that have passed
     const actualData = await SalesRecord.aggregate([
       {
         $match: {
@@ -257,6 +238,19 @@ router.get("/results/:runId", authMiddleware, async (req, res) => {
       { $sort: { _id: 1 } },
     ]);
 
+    const metrics =
+      metricsDoc &&
+      ({
+        mae: metricsDoc.mae,
+        rmse: metricsDoc.rmse,
+        mape: metricsDoc.mape,
+        r2Score: metricsDoc.r2Score,
+      });
+
+    const comparison = metricsDoc?.modelComparison?.length
+      ? metricsDoc.modelComparison
+      : undefined;
+
     res.json({
       run: predictionRun,
       predictions: predictions.map((p) => ({
@@ -267,6 +261,11 @@ router.get("/results/:runId", authMiddleware, async (req, res) => {
         confidenceUpper: p.confidenceUpper,
       })),
       metrics,
+      featureImportance: metricsDoc?.featureImportance || [],
+      comparison,
+      holdoutSeries: metricsDoc?.holdoutSeries?.length
+        ? metricsDoc.holdoutSeries
+        : undefined,
       actualData: actualData.slice(0, 14).map((d) => ({
         date: d._id,
         quantity: d.quantity,
@@ -328,32 +327,63 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
+      if (!String(process.env.ML_SERVICE_URL || "").trim()) {
+        return res.status(503).json({
+          message:
+            "ML service is not configured. Set ML_SERVICE_URL in Food-demand-forecasting-app-backend/.env and restart the API.",
+        });
+      }
+
       const { modelType } = req.body;
+
+      const historicalSales = await aggregateDailySales({});
+      if (historicalSales.length < MIN_ML_POINTS) {
+        return res.status(400).json({
+          message: `Need at least ${MIN_ML_POINTS} days of sales for retraining. Found ${historicalSales.length}.`,
+        });
+      }
+
+      const dates = historicalSales.map((d) => d._id);
+      const quantities = historicalSales.map((d) => d.quantity);
+
+      let ml;
+      try {
+        ml = await runRetrain({
+          dates,
+          quantities,
+          modelType,
+        });
+      } catch (e) {
+        const status = e.status && e.status >= 400 && e.status < 600 ? e.status : 502;
+        logger.error("ML retrain failed:", e.message);
+        return res.status(status).json({
+          message: e.message || "ML retraining service error",
+        });
+      }
 
       const runId = generateRunId();
       const predictionRun = new PredictionRun({
         runId,
-        modelName: getModelName(modelType),
+        modelName: ml.modelName || getModelName(modelType),
+        requestedModelType: modelType,
         forecastType: "daily",
         triggeredBy: req.userId,
         status: "completed",
       });
       await predictionRun.save();
 
-      // Generate new metrics (simulate retraining)
-      const metrics = { mae: 7.5, rmse: 9.2, mape: 4.8, r2: 0.94 };
+      const m = ml.metrics || {};
       await ModelMetric.create({
         runId: predictionRun._id,
-        ...metrics,
-        featureImportance: [
-          { feature: "lag_1", importance: 0.35 },
-          { feature: "rolling_avg_7", importance: 0.22 },
-          { feature: "day_of_week", importance: 0.14 },
-          { feature: "month", importance: 0.11 },
-          { feature: "is_weekend", importance: 0.09 },
-          { feature: "week_of_year", importance: 0.05 },
-          { feature: "quarter", importance: 0.04 },
-        ],
+        mae: m.mae,
+        rmse: m.rmse,
+        mape: m.mape,
+        r2Score: m.r2Score,
+        featureImportance: Array.isArray(ml.featureImportance)
+          ? ml.featureImportance
+          : [],
+        modelComparison: [],
+        holdoutSeries: [],
       });
 
       logger.info(`Model retrained: ${modelType} -> ${runId}`);
@@ -362,7 +392,13 @@ router.post(
         status: "success",
         message: `${modelType} model retrained successfully with latest dataset. New metrics available.`,
         runId: predictionRun.runId,
-        metrics,
+        metrics: {
+          mae: m.mae,
+          rmse: m.rmse,
+          mape: m.mape,
+          r2Score: m.r2Score,
+        },
+        featureImportance: ml.featureImportance || [],
       });
     } catch (error) {
       logger.error("Retrain error:", error);

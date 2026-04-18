@@ -18,6 +18,16 @@ const modelMetricSchema = new mongoose.Schema(
         importance: Number,
       },
     ],
+    /** When modelType was "all": per-model test metrics from ML service */
+    modelComparison: [mongoose.Schema.Types.Mixed],
+    /** Holdout evaluation points for actual vs predicted chart (winner model) */
+    holdoutSeries: [
+      {
+        date: String,
+        actual: Number,
+        predicted: Number,
+      },
+    ],
   },
   {
     timestamps: true,

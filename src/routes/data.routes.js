@@ -78,13 +78,16 @@ router.post(
 
       if (fileExt === ".csv") {
         const fileContent = fs.readFileSync(filePath, "utf8");
-        const rows = fileContent.split("\n");
-        const headers = rows[0].split(",");
+        const rows = fileContent.split(/\r?\n/).filter((r) => r.trim().length);
+        const rawHeaders = rows[0].split(",");
+        const headers = rawHeaders.map((h) =>
+          h.trim().replace(/^\uFEFF/, "")
+        );
         for (let i = 1; i < Math.min(rows.length, 101); i++) {
           const values = rows[i].split(",");
           const row = {};
           headers.forEach((header, idx) => {
-            row[header.trim()] = values[idx]?.trim();
+            row[header] = values[idx]?.trim();
           });
           if (Object.keys(row).length > 0) data.push(row);
         }
@@ -175,13 +178,16 @@ router.post(
 
       if (fileExt === ".csv") {
         const fileContent = fs.readFileSync(filePath, "utf8");
-        const rows = fileContent.split("\n");
-        const headers = rows[0].split(",");
+        const rows = fileContent.split(/\r?\n/).filter((r) => r.trim().length);
+        const rawHeaders = rows[0].split(",");
+        const headers = rawHeaders.map((h) =>
+          h.trim().replace(/^\uFEFF/, "")
+        );
         for (let i = 1; i < rows.length; i++) {
           const values = rows[i].split(",");
           const row = {};
           headers.forEach((header, idx) => {
-            row[header.trim()] = values[idx]?.trim();
+            row[header] = values[idx]?.trim();
           });
           if (Object.keys(row).length > 0) data.push(row);
         }
@@ -191,6 +197,11 @@ router.post(
         const worksheet = workbook.Sheets[sheetName];
         data = xlsx.utils.sheet_to_json(worksheet);
       }
+
+      const outlets = await Outlet.find().select("centerId").lean();
+      const outletSet = new Set(outlets.map((o) => o.centerId));
+      const foods = await FoodItem.find().select("mealId").lean();
+      const mealSet = new Set(foods.map((f) => f.mealId));
 
       // Validate and import data
       const validRecords = [];
@@ -203,21 +214,29 @@ router.post(
             row.centerId || row.center_id || row.outletId || row.outlet_id;
           const mealId =
             row.mealId || row.meal_id || row.foodItemId || row.food_item_id;
+          if (!centerId || !mealId) {
+            errors.push({ row, error: "Missing center or meal identifier" });
+            continue;
+          }
           const quantity = parseFloat(row.quantity);
           const customerCount = parseFloat(
             row.customerCount || row.customer_count || row.customers || 0
           );
+          if (Number.isNaN(quantity) || quantity < 0) {
+            errors.push({ row, error: "Invalid quantity" });
+            continue;
+          }
           const saleDate = new Date(row.saleDate || row.date);
-
-          // Verify outlet and food item exist
-          const outlet = await Outlet.findOne({ centerId });
-          if (!outlet) {
-            warnings.push(`Outlet ${centerId} not found, skipping record`);
+          if (Number.isNaN(saleDate.getTime())) {
+            errors.push({ row, error: "Invalid sale date" });
             continue;
           }
 
-          const foodItem = await FoodItem.findOne({ mealId });
-          if (!foodItem) {
+          if (!outletSet.has(centerId)) {
+            warnings.push(`Outlet ${centerId} not found, skipping record`);
+            continue;
+          }
+          if (!mealSet.has(mealId)) {
             warnings.push(`Food item ${mealId} not found, skipping record`);
             continue;
           }
@@ -228,7 +247,7 @@ router.post(
             saleDate,
             saleTime: row.saleTime || row.sale_time || row.time,
             quantity,
-            customerCount: isNaN(customerCount) ? 0 : customerCount,
+            customerCount: Number.isNaN(customerCount) ? 0 : customerCount,
             sourceType: "upload",
           });
         } catch (err) {
@@ -236,14 +255,28 @@ router.post(
         }
       }
 
-      // Insert valid records
+      const CHUNK = 500;
       let successfulRecords = 0;
-      for (const record of validRecords) {
+      for (let i = 0; i < validRecords.length; i += CHUNK) {
+        const chunk = validRecords.slice(i, i + CHUNK);
         try {
-          await SalesRecord.create(record);
-          successfulRecords++;
+          const inserted = await SalesRecord.insertMany(chunk, {
+            ordered: false,
+          });
+          successfulRecords += inserted.length;
         } catch (err) {
-          errors.push({ record, error: err.message });
+          logger.warn(
+            `insertMany chunk ${i}-${i + chunk.length} partial/fail:`,
+            err.message
+          );
+          for (const record of chunk) {
+            try {
+              await SalesRecord.create(record);
+              successfulRecords++;
+            } catch (e) {
+              errors.push({ record, error: e.message });
+            }
+          }
         }
       }
 

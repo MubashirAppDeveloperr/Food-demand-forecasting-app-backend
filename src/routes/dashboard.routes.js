@@ -1,6 +1,7 @@
 const express = require("express");
 const SalesRecord = require("../models/SalesRecord");
 const PredictionRun = require("../models/PredictionRun");
+const PredictionResult = require("../models/PredictionResult");
 const ModelMetric = require("../models/ModelMetric");
 const InventorySuggestion = require("../models/InventorySuggestion");
 const { authMiddleware } = require("../middleware/auth.middleware");
@@ -67,18 +68,45 @@ router.get("/summary", authMiddleware, async (req, res) => {
           ).toFixed(1)
         : 0;
 
-    // Get latest prediction
+    const localYmd = (d) => {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, "0");
+      const day = String(d.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+
+    // Latest completed forecast run + tomorrow quantity from stored predictions
     const latestRun = await PredictionRun.findOne({ status: "completed" }).sort(
       { runTime: -1 }
     );
     let predictedDemand = null;
+    let predictedDemandTomorrow = Math.floor(
+      (todayTotal.totalQuantity || 0) * 1.15
+    );
 
     if (latestRun) {
       const metrics = await ModelMetric.findOne({ runId: latestRun._id });
       predictedDemand = {
-        model: latestRun.modelName,
-        mape: metrics?.mape || null,
+        modelName: latestRun.modelName,
+        mape: metrics?.mape ?? null,
+        runId: latestRun.runId,
       };
+
+      const targetStr = localYmd(tomorrow);
+      const runPreds = await PredictionResult.find({ runId: latestRun._id }).sort({
+        forecastDate: 1,
+      });
+      const forTomorrow = runPreds.filter(
+        (p) => p.forecastDate.toISOString().slice(0, 10) === targetStr
+      );
+      if (forTomorrow.length > 0) {
+        predictedDemandTomorrow = forTomorrow.reduce(
+          (s, p) => s + (p.predictedQuantity || 0),
+          0
+        );
+      } else if (runPreds.length > 0) {
+        predictedDemandTomorrow = runPreds[0].predictedQuantity || 0;
+      }
     }
 
     // Get active alerts
@@ -102,11 +130,32 @@ router.get("/summary", authMiddleware, async (req, res) => {
       { $sort: { _id: 1 } },
     ]);
 
+    const recentRunDocs = await PredictionRun.find({ status: "completed" })
+      .sort({ runTime: -1 })
+      .limit(5)
+      .populate("triggeredBy", "name");
+    const recentRuns = await Promise.all(
+      recentRunDocs.map(async (run) => {
+        const m = await ModelMetric.findOne({ runId: run._id });
+        return {
+          ...run.toJSON(),
+          metrics: m
+            ? {
+                mae: m.mae,
+                rmse: m.rmse,
+                mape: m.mape,
+                r2Score: m.r2Score,
+              }
+            : undefined,
+        };
+      })
+    );
+
     res.json({
       kpis: {
         totalCustomersToday: todayTotal.totalCustomers,
         totalOrdersToday: todayTotal.totalQuantity,
-        predictedDemandTomorrow: Math.floor(todayTotal.totalQuantity * 1.15), // Simple prediction
+        predictedDemandTomorrow,
         activeAlertsCount: activeAlerts.length,
         customerChange: parseFloat(customerChange),
         orderChange: parseFloat(quantityChange),
@@ -117,10 +166,7 @@ router.get("/summary", authMiddleware, async (req, res) => {
         totalOrders: item.totalOrders,
         totalCustomers: item.totalCustomers,
       })),
-      recentRuns: await PredictionRun.find({ status: "completed" })
-        .sort({ runTime: -1 })
-        .limit(5)
-        .populate("triggeredBy", "name"),
+      recentRuns,
       alerts: activeAlerts.slice(0, 5).map((alert) => ({
         id: alert._id,
         message:

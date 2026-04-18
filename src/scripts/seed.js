@@ -11,6 +11,9 @@ const seed = async () => {
   try {
     await mongoose.connect(process.env.MONGODB_URI);
     console.log("Connected to MongoDB for seeding");
+    console.warn(
+      "WARNING: This script DELETES all users, outlets, food items, and sales, then recreates samples. Do not run on a DB where you have CSV imports you want to keep."
+    );
 
     // Clear existing data (optional - comment out if you want to keep existing)
     await User.deleteMany({});

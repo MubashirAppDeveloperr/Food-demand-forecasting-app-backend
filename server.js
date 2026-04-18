@@ -4,7 +4,9 @@ const cors = require("cors");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const path = require("path");
-require("dotenv").config();
+// Load .env from this package root (not process.cwd()), so ML_SERVICE_URL etc. work when
+// npm/node is started from another directory.
+require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const authRoutes = require("./src/routes/auth.routes");
 const userRoutes = require("./src/routes/user.routes");
